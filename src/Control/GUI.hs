@@ -145,6 +145,7 @@ gui v ve f = GUI $ Var $ \i -> do
     case e of
         NoEvent -> return (UX ui NoEvent, runGUI $ gui v' ve' f)
         Event b -> return (UX ui (Event $ f a b), pure $ UX [] $ Event $ f a b)
+
 --------------------------------------------------------------------------------
 -- $transformation
 -- Simply put - here we are applying some kind of transformation to your
