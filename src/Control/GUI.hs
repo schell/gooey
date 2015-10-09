@@ -15,6 +15,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE InstanceSigs #-}
 module Control.GUI (
     -- * Definition
     UX(..),
@@ -27,7 +28,9 @@ module Control.GUI (
     transformGUI,
     -- * Combination
     -- $combination
-    combineGUI
+    combineGUI,
+    combineGUIUntil,
+    eitherGUI
 ) where
 
 import Control.Varying
@@ -49,6 +52,11 @@ data UX a b = UX a (Event b)
 -- | A UX is a functor by applying a function to the contained event's value.
 instance Functor (UX a) where
     fmap f (UX a b) = UX a $ fmap f b
+
+-- | A UX is a monoid if its left and right types are monoids.
+instance (Monoid a, Monoid b) => Monoid (UX a b) where
+    mempty = UX mempty (Event mempty)
+    mappend (UX a ea) (UX b eb) = UX (mappend a b) (mappend <$> ea <*> eb)
 
 -- | A UX is an applicative if its left datatype is a monoid. It replies to
 -- 'pure' with an empty left value while the right value is the argument
@@ -119,7 +127,7 @@ instance (MonadIO m, Monoid a) => MonadIO (GUI m i a) where
 -- | Creates a new GUI displaying an interface that eventually produces a value.
 -- The type used to represent the user interface must have a 'Decomposable'
 -- instance, that way the resulting GUI\'s discrete values can be rendered.
-gui :: (Monad m, Composite a m r t)
+gui :: (Monad m, Monad n, Composite a n r t)
     => Var m i a
     -- ^ The stream of a changing user interface.
     -> Var m i (Event b)
@@ -129,7 +137,7 @@ gui :: (Monad m, Composite a m r t)
     -> (a -> b -> c)
     -- ^ The merging function that combines the interface's final value with the
     -- value produced by the event stream.
-    -> GUI m i [(t, Element m r t)] c
+    -> GUI m i [(t, Element n r t)] c
 gui v ve f = GUI $ Var $ \i -> do
     (a, v')  <- runVar v i
     (e, ve') <- runVar ve i
@@ -145,12 +153,6 @@ gui v ve f = GUI $ Var $ \i -> do
 -- same domain it\'s possible to tween GUIs.
 --------------------------------------------------------------------------------
 -- | Transforms a GUI.
---transformGUI :: (Monad m, Monoid t, Composite a m r t)
---             => Var m i t
---             -- ^ The stream of a changing transformation.
---             -> GUI m i a b
---             -- ^ The GUI to transform.
---             -> GUI m i a b
 transformGUI :: (Monad m, Monoid t)
              => Var m i t -> GUI m i [(t, d)] b -> GUI m i [(t, d)] b
 transformGUI vt g = GUI $ Var $ \i -> do
@@ -160,7 +162,11 @@ transformGUI vt g = GUI $ Var $ \i -> do
     return (UX ui' e, runGUI $ transformGUI vt' $ GUI v)
 --------------------------------------------------------------------------------
 -- $combination
--- Combining two GUIs creates a new GUI.
+-- Combining two GUIs creates a new GUI. The strategy taken to combine the
+-- result values of the two GUIs must be provided. With 'combineGUI' the
+-- GUI runs until both component GUIs have concluded. With 'combineGUIUntil'
+-- the GUI runs until either both component GUIs have concluded or
+-- until a switching event occurs.
 --------------------------------------------------------------------------------
 -- | Combines two GUIs. The resulting GUI will not produce a value until
 -- both component GUIs have produced a value. At that moment a merging function
@@ -180,3 +186,45 @@ combineGUI (GUI va) (GUI vb) f = GUI $ Var $ \i -> do
         (UX b eb, vb') <- runVar vb i
         return (UX (a <> b) (f <$> ea <*> eb),
                 runGUI $ combineGUI (GUI va') (GUI vb') f)
+
+-- | Combines two GUIs. The resulting GUI will not produce a value until
+-- either both component GUIs have produced a value, or until a switching
+-- event occurs. At that moment a merging function is used to combine any
+-- available produced values in the resulting GUI\'s return type.
+-- The component GUIs\' graphical representations (the left UX values) are
+-- 'mappend'\d together.
+combineGUIUntil :: (Monad m, Monoid u)
+                => GUI m i u a
+                -> GUI m i u b
+                -> Var m i (Event c)
+                -> (Either c (a,b) -> d)
+                -> GUI m i u d
+combineGUIUntil (GUI va) (GUI vb) vc f = GUI $ Var $ \i -> do
+    (UX ua ea, va') <- runVar va i
+    (UX ub eb, vb') <- runVar vb i
+    (ec, vc')       <- runVar vc i
+    let g ex v = case ex of
+                     Event x -> pure $ UX mempty $ Event x
+                     NoEvent -> v
+        va'' = g ea va'
+        vb'' = g eb vb'
+        ma = toMaybe ea
+        mb = toMaybe eb
+        mc = toMaybe ec
+        e  = case (ma,mb,mc) of
+                 (Just a, Just b,      _) -> Event $ f $ Right (a, b)
+                 (     _,      _, Just c) -> Event $ f $ Left c
+                 _                        -> NoEvent
+    return (UX (ua <> ub) e, runGUI $ combineGUIUntil (GUI va'') (GUI vb'') vc' f)
+
+-- | Run two GUIs at the same time and return the result of the GUI that
+-- concludes first.
+eitherGUI :: (Monad m, Monoid u) => GUI m i u a -> GUI m i u a -> GUI m i u a
+eitherGUI (GUI va) (GUI vb) = GUI $ Var $ \i -> do
+    (UX ua ea, va') <- runVar va i
+    (UX ub eb, vb') <- runVar vb i
+    case (ea,eb) of
+        (Event _,_) -> return (UX (ua <> ub) ea, va')
+        (_,Event _) -> return (UX (ua <> ub) eb, vb')
+        (_,_)       -> return (UX (ua <> ub) NoEvent,
+                               runGUI $ eitherGUI (GUI va') (GUI vb') )
